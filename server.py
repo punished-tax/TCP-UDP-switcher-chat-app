@@ -1,97 +1,191 @@
 #server.py
-import selectors, socket, types, traceback
-from proto import pack_frame, tcp_recv_frames, now_ms, loads, dumps
+import selectors, socket, traceback
+from proto import pack_frame, tcp_recv_frames, now_ms, loads, dumps, sign, verify
 
 HOST, PORT = "0.0.0.0", 12000
-
 sel = selectors.DefaultSelector()
 
-#TCP listen socket
+#TCP listener
 ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-ls.bind((HOST, PORT)); ls.listen(); ls.setblocking(False)
+ls.bind((HOST, PORT))
+ls.listen()
+ls.setblocking(False)
 sel.register(ls, selectors.EVENT_READ, data=("accept", None))
 
 #UDP socket
 us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-us.bind((HOST, PORT)); us.setblocking(False)
+us.bind((HOST, PORT))
+us.setblocking(False)
 sel.register(us, selectors.EVENT_READ, data=("udp", None))
 
-tcp_buf = {}    #sock -> bytearray
-tcp_nick = {}   #sock -> nick
-udp_nick = {}   #(addr,port) -> nick
+# ---- State ----
+tcp_buf = {}        #sock -> bytearray
+name_tcp = {}       #name -> sock
+name_udp = {}       #name -> (addr, port)
+tcp_name = {}       #sock -> name
+udp_name = {}       #(addr,port) -> name
 
-def tcp_broadcast(obj, exclude=None):
-    msg = pack_frame(obj)
-    for s in list(tcp_nick.keys()):
-        if s is exclude: continue
-        try: s.sendall(msg)
+def all_names():
+    return sorted(set(name_tcp.keys()) | set(name_udp.keys()))
+
+def send_tcp(sock, obj):
+    try:
+        sock.sendall(pack_frame(sign(obj)))
+    except Exception:
+        close_tcp(sock)
+
+def send_udp(addr, obj):
+    try:
+        us.sendto(dumps(sign(obj)), addr)
+    except Exception:
+        pass
+
+def broadcast(obj, exclude_tcp=None, exclude_udp=None):
+    msg = sign(obj)
+    data_tcp = pack_frame(msg)
+    data_udp = dumps(msg)
+    #TCP
+    for n, s in list(name_tcp.items()):
+        if s is exclude_tcp:
+            continue
+        try:
+            s.sendall(data_tcp)
         except Exception:
             close_tcp(s)
-
-def udp_broadcast(obj, exclude_addr=None):
-    msg = dumps(obj)
-    for addr in list(udp_nick.keys()):
-        if addr == exclude_addr: continue
-        try: us.sendto(msg, addr)
-        except Exception: udp_nick.pop(addr, None)
+    #UDP
+    for n, addr in list(name_udp.items()):
+        if addr == exclude_udp:
+            continue
+        try:
+            us.sendto(data_udp, addr)
+        except Exception:
+            pass
 
 def close_tcp(s):
-    nick = tcp_nick.pop(s, None)
-    tcp_buf.pop(s, None)
-    try: sel.unregister(s)
-    except Exception: pass
-    try: s.close()
-    except Exception: pass
-    if nick:
-        tcp_broadcast({"type":"sys","mode":"tcp","text":f"{nick} left","ts":now_ms()})
+    name = tcp_name.pop(s, None)
+    if name:
+        name_tcp.pop(name, None)
+        broadcast({"type": "sys", "text": f"{name} left", "ts": now_ms()})
+    try:
+        sel.unregister(s)
+    except Exception:
+        pass
+    try:
+        s.close()
+    except Exception:
+        pass
 
-print(f"Chat server ready on TCP/UDP {HOST}:{PORT}")
+def handle_join(name, transport, sock=None, addr=None):
+    if not name or name in all_names():
+        obj = {"type": "err", "text": "Name taken or invalid", "ts": now_ms()}
+        if transport == "tcp" and sock:
+            send_tcp(sock, obj)
+        elif addr:
+            send_udp(addr, obj)
+        return False
+    if transport == "tcp" and sock:
+        tcp_name[sock] = name
+        name_tcp[name] = sock
+    else:
+        udp_name[addr] = name
+        name_udp[name] = addr
+    broadcast({"type": "sys", "text": f"{name} joined", "ts": now_ms()})
+    return True
+
+def handle_msg(name, text, from_tcp=None, from_udp=None):
+    broadcast({"type": "msg", "name": name, "text": text, "ts": now_ms()},
+              exclude_tcp=from_tcp, exclude_udp=from_udp)
+
+def handle_list(target_tcp=None, target_udp=None):
+    obj = {"type": "list", "users": all_names(), "ts": now_ms()}
+    if target_tcp:
+        send_tcp(target_tcp, obj)
+    if target_udp:
+        send_udp(target_udp, obj)
+
+def handle_whisper(sender, to_name, text):
+    if to_name in name_tcp:
+        send_tcp(name_tcp[to_name], {"type": "whisper", "from": sender, "text": text, "ts": now_ms()})
+        return True
+    if to_name in name_udp:
+        send_udp(name_udp[to_name], {"type": "whisper", "from": sender, "text": text, "ts": now_ms()})
+        return True
+    return False
+
+print(f"Chat server established on {HOST}:{PORT}")
 
 while True:
     for key, ev in sel.select(timeout=1.0):
         kind, _ = key.data
         try:
-            if kind == "accept":  #new TCP connection
+            if kind == "accept":
                 conn, addr = key.fileobj.accept()
                 conn.setblocking(False)
                 tcp_buf[conn] = bytearray()
                 sel.register(conn, selectors.EVENT_READ, data=("tcp", None))
-            elif kind == "tcp":   #TCP client traffic
+
+            elif kind == "tcp":
                 s = key.fileobj
-                cont = tcp_recv_frames(s, tcp_buf[s])
-                if cont is False:
-                    close_tcp(s); continue
-                for obj in cont if not isinstance(cont, bool) else []:
+                out = tcp_recv_frames(s, tcp_buf[s])
+                if out is False:
+                    close_tcp(s)
+                    continue
+                for obj in out if not isinstance(out, bool) else []:
+                    if not verify(obj):
+                        send_tcp(s, {"type": "err", "text": "Bad MAC", "ts": now_ms()})
+                        continue
                     t = obj.get("type")
+                    name = tcp_name.get(s)
                     if t == "join":
-                        tcp_nick[s] = obj.get("nick","?")
-                        tcp_broadcast({"type":"sys","mode":"tcp","text":f"{tcp_nick[s]} joined","ts":now_ms()})
-                    elif t == "msg":
-                        nick = tcp_nick.get(s, "?")
-                        tcp_broadcast({"type":"msg","mode":"tcp","nick":nick,"text":obj.get("text",""),"ts":now_ms()})
-                    elif t == "leave":
+                        handle_join(obj.get("name", ""), "tcp", sock=s)
+                    elif t == "msg" and name:
+                        handle_msg(name, obj.get("text", ""), from_tcp=s)
+                    elif t == "cmd" and name:
+                        cmd = obj.get("cmd")
+                        if cmd == "list":
+                            handle_list(target_tcp=s)
+                        elif cmd == "whisper":
+                            ok = handle_whisper(name, obj.get("to", ""), obj.get("text", ""))
+                            if not ok:
+                                send_tcp(s, {"type": "err", "text": "No such user", "ts": now_ms()})
+                    elif t == "leave" and name:
                         close_tcp(s)
-            elif kind == "udp":   #UDP datagram
+
+            elif kind == "udp":
                 data, addr = us.recvfrom(65535)
                 try:
                     obj = loads(data)
                 except Exception:
                     continue
+                if not verify(obj):
+                    send_udp(addr, {"type": "err", "text": "Bad MAC", "ts": now_ms()})
+                    continue
                 t = obj.get("type")
                 if t == "join":
-                    udp_nick[addr] = obj.get("nick","?")
-                    udp_broadcast({"type":"sys","mode":"udp","text":f"{udp_nick[addr]} joined","ts":now_ms()})
+                    handle_join(obj.get("name", ""), "udp", addr=addr)
                 elif t == "msg":
-                    nick = udp_nick.get(addr, obj.get("nick","?"))
-                    udp_nick.setdefault(addr, nick)
-                    udp_broadcast({"type":"msg","mode":"udp","nick":nick,"text":obj.get("text",""),"ts":now_ms()})
+                    name = udp_name.get(addr)
+                    if name:
+                        handle_msg(name, obj.get("text", ""), from_udp=addr)
+                elif t == "cmd":
+                    cmd = obj.get("cmd")
+                    if cmd == "list":
+                        handle_list(target_udp=addr)
+                    elif cmd == "whisper":
+                        sender = udp_name.get(addr)
+                        if not sender:
+                            send_udp(addr, {"type": "err", "text": "Join first", "ts": now_ms()})
+                        else:
+                            ok = handle_whisper(sender, obj.get("to", ""), obj.get("text", ""))
+                            if not ok:
+                                send_udp(addr, {"type": "err", "text": "No such user", "ts": now_ms()})
                 elif t == "leave":
-                    nick = udp_nick.pop(addr, None)
-                    if nick:
-                        udp_broadcast({"type":"sys","mode":"udp","text":f"{nick} left","ts":now_ms()})
+                    name = udp_name.pop(addr, None)
+                    if name:
+                        name_udp.pop(name, None)
+                        broadcast({"type": "sys", "text": f"{name} left", "ts": now_ms()})
         except Exception:
-            #defensive: don't crash on one bad client
             if kind == "tcp":
                 close_tcp(key.fileobj)
             else:
